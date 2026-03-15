@@ -13,11 +13,12 @@ export default function Processing() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    if (selectedGames.length < 4 || !answers.length) {
+    const games = selectedGames.filter(Boolean);
+    if (games.length < 4 || !answers.length) {
       navigate('/game/select');
       return;
     }
-    const gameIds = selectedGames.map((g) => g.id);
+    const gameIds = games.map((g) => g.id);
     submitResult(gameIds, answers)
       .then((data) => {
         setResult(data);

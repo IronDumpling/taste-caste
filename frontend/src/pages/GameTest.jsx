@@ -14,11 +14,12 @@ export default function GameTest() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    if (selectedGames.length < 4) {
+    const games = selectedGames.filter(Boolean);
+    if (games.length < 4) {
       navigate('/game/select');
       return;
     }
-    const ids = selectedGames.map((g) => g.id);
+    const ids = games.map((g) => g.id);
     getTestQuestions(ids)
       .then((data) => {
         setQuestions(Array.isArray(data) ? data : []);

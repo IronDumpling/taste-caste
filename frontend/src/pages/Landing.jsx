@@ -18,7 +18,7 @@ export default function Landing() {
         animate={{ opacity: 1 }}
         transition={{ delay: 0.2 }}
       >
-        赛博品味种姓 · 鉴定你的数字灵魂
+        赛博种姓 · 鉴定你的数字灵魂
       </motion.p>
       <motion.div
         className="flex flex-wrap justify-center gap-4"

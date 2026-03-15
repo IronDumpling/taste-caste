@@ -1,110 +1,122 @@
-import { Router } from 'express';
-import { getGamesByIds, coverImageUrl } from '../services/igdb-client.js';
-import { aggregateScoreForWork } from '../services/score-aggregator.js';
-import { computeResult } from '../services/scoring-engine.js';
-
-const router = Router();
-const NUM_QUESTIONS = 4;
-
 /**
- * Generate test questions from selected game IDs (deterministic: same ids -> same questions).
- * Used by both test-questions and result.
+ * IGDB API v4 client (Twitch OAuth). Exports: searchGames, getGamesByIds, getGamesByGenres, getPopularGames, coverImageUrl.
+ * Set IGDB_BASE_URL and TWITCH_TOKEN_URL in env to point at a mock server (e.g. mock-igdb) when without credentials.
  */
-async function generateQuestions(gameIds) {
-  if (!gameIds?.length) return [];
-  const games = await getGamesByIds(gameIds);
-  const genreIds = [...new Set(games.flatMap((g) => g.genres || []))];
-  const excludeIds = new Set(gameIds);
 
-  let pool = [];
-  if (genreIds.length > 0) {
-    const body = [
-      `where genres = (${genreIds.join(',')}) & id != (${gameIds.join(',')});`,
-      'fields name,cover,genres,aggregated_rating,rating_count;',
-      'limit 30;',
-    ].join('\n');
-    const { default: igdbRequest } = await import('../services/igdb-client.js');
-    const igdb = await import('../services/igdb-client.js');
-    const raw = await igdb.getGamesByIds ? await igdb.getGamesByIds(genreIds.slice(0, 5).map((_, i) => genreIds[i])) : [];
-    const { getGamesByIds: getByGenre } = await import('../services/igdb-client.js');
-    const genreGames = await getByGenre(genreIds.slice(0, 10));
-    pool = genreGames.filter((g) => !excludeIds.has(g.id));
+const IGDB_BASE = process.env.IGDB_BASE_URL || 'https://api.igdb.com/v4';
+const TWITCH_TOKEN_URL = process.env.TWITCH_TOKEN_URL || 'https://id.twitch.tv/oauth2/token';
+
+let cachedToken = null;
+let tokenExpiry = 0;
+
+async function getAccessToken() {
+  if (cachedToken && Date.now() < tokenExpiry - 60000) {
+    return cachedToken;
   }
-
-  if (pool.length < 2) {
-    const all = await getGamesByIds([]);
-    const body = 'where aggregated_rating != null; fields name,cover,genres,aggregated_rating,rating_count; limit 30;';
-    const { igdbRequest } = await import('../services/igdb-client.js');
-    const igdb = await import('../services/igdb-client.js');
-    const res = await fetch('https://api.igdb.com/v4/games', {
-      method: 'POST',
-      headers: {
-        'Client-ID': process.env.IGDB_CLIENT_ID,
-        Authorization: `Bearer ${await (await import('../services/igdb-client.js')).getAccessToken?.()}`,
-        'Content-Type': 'text/plain',
-      },
-      body: 'where aggregated_rating != null; fields name,cover,genres,aggregated_rating,rating_count; limit 30;',
-    });
-    const data = res.ok ? await res.json() : [];
-    pool = (Array.isArray(data) ? data : []).filter((g) => !excludeIds.has(g.id));
+  const clientId = process.env.IGDB_CLIENT_ID;
+  const clientSecret = process.env.IGDB_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error('IGDB_CLIENT_ID and IGDB_CLIENT_SECRET must be set');
   }
-
-  const { getGamesByIds: fetchPool } = await import('../services/igdb-client.js');
-  const poolGames = await fetchPool(genreIds);
-  const filtered = (Array.isArray(poolGames) ? poolGames : []).filter((g) => !excludeIds.has(g.id));
-  if (filtered.length < 2) {
-    const fallbackBody = 'where rating_count > 0; fields name,cover,genres,aggregated_rating,rating_count; limit 40;';
-    const { default: igdb } = await import('../services/igdb-client.js');
-    const mod = await import('../services/igdb-client.js');
-    const req = mod.igdbRequest || (async () => []);
-    const fallback = await (async () => {
-      try {
-        const fn = mod.igdbRequest;
-        if (typeof fn !== 'function') return [];
-        return await fn('games', fallbackBody);
-      } catch {
-        return [];
-      }
-    })();
-    pool = Array.isArray(fallback) ? fallback.filter((g) => !excludeIds.has(g?.id)) : [];
-  } else {
-    pool = filtered;
-  }
-
-  const withScores = pool.map((g) => {
-    const raw = { igdb: { aggregated_rating: g.aggregated_rating, rating_count: g.rating_count } };
-    const { popularity: p, critic: c } = aggregateScoreForWork(raw);
-    return {
-      id: g.id,
-      name: g.name,
-      cover: coverImageUrl(g.cover),
-      p: Math.round(p * 10) / 10,
-      c: Math.round(c * 10) / 10,
-    };
+  const params = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: 'client_credentials',
   });
-
-  const questions = [];
-  const used = new Set();
-  for (let i = 0; i < NUM_QUESTIONS && withScores.length >= 2; i++) {
-    const available = withScores.filter((x) => !used.has(x.id));
-    if (available.length < 2) break;
-    const shuffle = [...available].sort(() => Math.random() - 0.5);
-    const left = shuffle[0];
-    const right = shuffle[1];
-    used.add(left.id);
-    used.add(right.id);
-    questions.push({
-      questionId: `q-${gameIds.join('-')}-${i}`,
-      prompt: '你更偏爱哪一边？',
-      left: { id: left.id, name: left.name, cover: left.cover, p: left.p, c: left.c },
-      right: { id: right.id, name: right.name, cover: right.cover, p: right.p, c: right.c },
-    });
+  const res = await fetch(`${TWITCH_TOKEN_URL}?${params}`, { method: 'POST' });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`IGDB token failed: ${res.status} ${text}`);
   }
-  return questions;
+  const data = await res.json();
+  cachedToken = data.access_token;
+  tokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+  return cachedToken;
 }
 
-I'll simplify: add a dedicated function in igdb-client to fetch games by genre (or a simple "get some games" for pool), then a shared module that builds questions so both routes use it.
-</think>
-Adding a genre-query helper and a shared question generator.
-<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
-StrReplace
+/**
+ * @param {string} endpoint - e.g. 'games'
+ * @param {string} body - Apical query body
+ * @returns {Promise<Array>}
+ */
+async function igdbRequest(endpoint, body) {
+  const token = await getAccessToken();
+  const res = await fetch(`${IGDB_BASE}/${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Client-ID': process.env.IGDB_CLIENT_ID,
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'text/plain',
+    },
+    body,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`IGDB request failed: ${res.status} ${text}`);
+  }
+  return res.json();
+}
+
+const GAME_FIELDS = 'id,name,cover,genres,aggregated_rating,rating_count';
+
+/**
+ * @param {string} q - search query
+ * @param {number} [limit=20]
+ * @returns {Promise<Array<{id, name, cover, genres, aggregated_rating, rating_count}>>}
+ */
+export async function searchGames(q, limit = 20) {
+  if (!q?.trim()) return [];
+  const body = `search "${q.trim().replace(/"/g, '\\"')}"; fields ${GAME_FIELDS}; limit ${Math.min(limit, 50)};`;
+  const data = await igdbRequest('games', body);
+  return Array.isArray(data) ? data : [];
+}
+
+/**
+ * @param {number[]} ids
+ * @returns {Promise<Array<{id, name, cover, genres, aggregated_rating, rating_count}>>}
+ */
+export async function getGamesByIds(ids) {
+  if (!ids?.length) return [];
+  const clean = ids.filter((n) => Number.isInteger(n) && n > 0);
+  if (!clean.length) return [];
+  const body = `where id = (${clean.join(',')}); fields ${GAME_FIELDS};`;
+  const data = await igdbRequest('games', body);
+  return Array.isArray(data) ? data : [];
+}
+
+/**
+ * @param {number[]} genreIds
+ * @param {number[]} excludeGameIds
+ * @param {number} [limit=40]
+ * @returns {Promise<Array>}
+ */
+export async function getGamesByGenres(genreIds, excludeGameIds, limit = 40) {
+  if (!genreIds?.length) return [];
+  const exclude = excludeGameIds?.length ? ` & id != (${excludeGameIds.join(',')})` : '';
+  const body = `where genres = (${genreIds.join(',')})${exclude}; fields ${GAME_FIELDS}; limit ${Math.min(limit, 100)};`;
+  const data = await igdbRequest('games', body);
+  return Array.isArray(data) ? data : [];
+}
+
+/**
+ * @param {number} [limit=40]
+ * @returns {Promise<Array>}
+ */
+export async function getPopularGames(limit = 40) {
+  const body = `where aggregated_rating != null & rating_count > 0; fields ${GAME_FIELDS}; sort rating_count desc; limit ${Math.min(limit, 100)};`;
+  const data = await igdbRequest('games', body);
+  return Array.isArray(data) ? data : [];
+}
+
+/**
+ * @param {number|string|{image_id?: string}|null|undefined} cover - IGDB cover id or cover object
+ * @returns {string|null}
+ */
+export function coverImageUrl(cover) {
+  if (cover == null) return null;
+  const id = typeof cover === 'object' && cover?.image_id != null
+    ? String(cover.image_id)
+    : String(cover);
+  if (!id) return null;
+  return `https://images.igdb.com/igdb/image/upload/t_cover_big/${id}.png`;
+}
